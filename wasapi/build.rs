@@ -7,10 +7,11 @@ fn main() {
             WAVEFORMATEXTENSIBLE,
             WAVE_FORMAT_PCM,
             WAVE_FORMAT_IEEE_FLOAT,
+            KSDATAFORMAT_SUBTYPE_PCM,
             KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
         },
         Windows::Win32::Media::Audio::DirectMusic::IPropertyStore,
-        Windows::Win32::System::Com::{COINIT_MULTITHREADED, CoTaskMemAlloc, CoTaskMemFree, CLSIDFromProgID, CoInitializeEx, CoCreateInstance, CLSCTX},
+        Windows::Win32::System::Com::{COINIT_MULTITHREADED, CoTaskMemAlloc, CoTaskMemFree, CLSIDFromProgID, CoInitializeEx, CoCreateInstance, CLSCTX, CLSCTX_ALL},
         Windows::Win32::System::Threading::{
             CreateEventA,
             ResetEvent,

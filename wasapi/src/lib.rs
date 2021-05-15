@@ -1,7 +1,7 @@
 ::windows::include_bindings!();
 use Windows::Win32::System::PropertiesSystem::PROPERTYKEY;
 
-#[allow(non_snake_case)]
+#[allow(non_upper_case_globals)]
 pub const PKEY_Device_FriendlyName: PROPERTYKEY = PROPERTYKEY {
     fmtid: windows::Guid::from_values(
         0xA45C254E,
@@ -12,7 +12,7 @@ pub const PKEY_Device_FriendlyName: PROPERTYKEY = PROPERTYKEY {
     pid: 14,
 };
 
-#[allow(non_snake_case)]
+#[allow(non_upper_case_globals)]
 pub const PKEY_Device_DeviceDesc: PROPERTYKEY = PROPERTYKEY {
     fmtid: windows::Guid::from_values(
         0xA45C254E,
