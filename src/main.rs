@@ -1,10 +1,11 @@
 use std::mem;
 use std::ptr;
+use std::slice;
 use wasapi::{
     PKEY_Device_FriendlyName,
     Windows::Win32::Media::Audio::CoreAudio::{
-        eConsole, eRender, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-        AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE,
+        eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+        AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE, WAVE_FORMAT_EXTENSIBLE,
     },
     Windows::Win32::Media::Multimedia::{
         WAVEFORMATEX,
@@ -23,7 +24,16 @@ use wasapi::{
     },
     Windows::Win32::System::PropertiesSystem::PropVariantToStringAlloc,
     Windows::Win32::System::PropertiesSystem::PROPERTYKEY,
-    Windows::Win32::System::SystemServices::PWSTR,
+    Windows::Win32::System::SystemServices::{PSTR, PWSTR},
+    Windows::Win32::System::Threading::{
+        CreateEventA,
+        ResetEvent,
+        SetEvent,
+        WAIT_RETURN_CAUSE,
+        WAIT_OBJECT_0,
+        WaitForSingleObject,
+        WaitForMultipleObjects,
+    },
 };
 use widestring::U16CString;
 use windows::Interface;
@@ -113,30 +123,122 @@ fn main() -> windows::Result<()> {
 
             let audio_client = audio_client.assume_init();
             //let mut desired_format = mem::MaybeUninit::<*mut WAVEFORMATEXTENSIBLE>::zeroed();
+            let bits = 16;
+            let validbits = 16;
+            let srate = 48000;
+            let channels = 2;
+            let blockalign = channels * bits / 8;
+            let byterate = srate * blockalign;
+
             let desired_format = WAVEFORMATEX {
-                cbSize: 0,
-                nAvgBytesPerSec: 176400, 
-                nBlockAlign: 4, 
-                nChannels: 2,
-                nSamplesPerSec: 44100,
-                wBitsPerSample: 16,
-                wFormatTag: WAVE_FORMAT_PCM as u16,
+                cbSize: 22,
+                nAvgBytesPerSec: byterate,
+                nBlockAlign: blockalign as u16, 
+                nChannels: channels as u16,
+                nSamplesPerSec: srate,
+                wBitsPerSample: bits as u16,
+                wFormatTag: WAVE_FORMAT_EXTENSIBLE as u16,
             };
-            //let sample = WAVEFORMATEXTENSIBLE_0 {
-            //    wValidBitsPerSample: 24,
-            //};
+            let sample = WAVEFORMATEXTENSIBLE_0 {
+                wValidBitsPerSample: validbits,
+            };
             let desired_format_ex = WAVEFORMATEXTENSIBLE {
                 Format: desired_format,
-                Samples: WAVEFORMATEXTENSIBLE_0 {
-                    wValidBitsPerSample: 16,
-                },
+                Samples: sample,
                 SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
-                dwChannelMask: 0,
+                dwChannelMask: 3,
+            };
+            println!("nAvgBytesPerSec {:?}", { desired_format_ex.Format.nAvgBytesPerSec });
+            println!("cbSize {:?}", { desired_format_ex.Format.cbSize });
+            println!("nBlockAlign {:?}", { desired_format_ex.Format.nBlockAlign });
+            println!("wBitsPerSample {:?}", { desired_format_ex.Format.wBitsPerSample });
+            println!("nSamplesPerSec {:?}", { desired_format_ex.Format.nSamplesPerSec });
+            println!("wFormatTag {:?}", { desired_format_ex.Format.wFormatTag });
+            println!("wValidBitsPerSample {:?}", { desired_format_ex.Samples.wValidBitsPerSample });
+            println!("SubFormat {:?}", { desired_format_ex.SubFormat });
+
+
+            let desired_format_simple = WAVEFORMATEX {
+                cbSize: 0,
+                nAvgBytesPerSec: byterate,
+                nBlockAlign: blockalign as u16, 
+                nChannels: channels as u16,
+                nSamplesPerSec: srate,
+                wBitsPerSample: bits as u16,
+                wFormatTag: WAVE_FORMAT_PCM as u16,
             };
 
             let supported = audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, &desired_format_ex as *const _ as *const WAVEFORMATEX, ptr::null_mut());
-            println!("supported {:?}", supported.ok());
+            println!("supported {:?}\n", supported.ok());
+
+            let mut def_time = 0;
+            let mut min_time = 0;
+            let res = audio_client.GetDevicePeriod(&mut def_time, &mut min_time);
+            println!("result {:?}", res.ok());
+            println!("default period {}, min period {}", def_time, min_time);
+
+
+            let res = audio_client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    def_time,
+                    def_time,
+                    &desired_format_ex as *const _ as *const WAVEFORMATEX,
+                    std::ptr::null());
+            println!("result {:?}", res.ok());
+
+            let h_event = CreateEventA(std::ptr::null_mut(), false, false, PSTR::default());
+
+            let hr = audio_client.SetEventHandle(h_event);
+            println!("result {:?}", hr.ok());
+            
+            let mut bufferFrameCount = 0;
+            let hr = audio_client.GetBufferSize(&mut bufferFrameCount);
+            println!("result {:?}", hr.ok());
+            println!("bufferFrameCount {}",bufferFrameCount);
+
+            let render_client: IAudioRenderClient = audio_client.GetService()?;
+
+            let hr = audio_client.Start();
+            println!("result {:?}", hr.ok());
+
+            for n in 0..128 {
+                let mut data = mem::MaybeUninit::uninit();
+                render_client
+                    .GetBuffer(bufferFrameCount, data.as_mut_ptr())
+                    .ok()?;
+
+                let mut dataptr = data.assume_init();
+                let mut databuf = slice::from_raw_parts_mut(dataptr, (bufferFrameCount*blockalign) as usize);
+                for m in 0..bufferFrameCount*blockalign/2 {
+                    databuf[m as usize] = 10;
+                }
+                render_client.ReleaseBuffer(bufferFrameCount, 0);
+                println!("wrote frames");
+
+                let retval = WaitForSingleObject(h_event, 100);
+                if (retval != WAIT_OBJECT_0)
+                {
+                    // Event handle timed out after a 2-second wait.
+                    audio_client.Stop();
+                    break;
+                }
+
+            }
+
+            /*
+            let mut desired_format_result: *mut WAVEFORMATEXTENSIBLE = ptr::null_mut();
+            let supported = audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, &desired_format_ex as *const _ as *const WAVEFORMATEX, &mut desired_format_result as *mut _ as *mut *mut WAVEFORMATEX);
+            println!("nAvgBytesPerSec {:?}", (*desired_format_result).Format.nAvgBytesPerSec);
+            println!("cbSize {:?}", (*desired_format_result).Format.cbSize);
+            println!("nBlockAlign {:?}", (*desired_format_result).Format.nBlockAlign);
+            println!("wBitsPerSample {:?}", (*desired_format_result).Format.wBitsPerSample);
+            println!("nSamplesPerSec {:?}", (*desired_format_result).Format.nSamplesPerSec);
+            println!("wFormatTag {:?}", (*desired_format_result).Format.wFormatTag);
+            println!("wValidBitsPerSample {:?}", (*desired_format_result).Samples.wValidBitsPerSample);
+            println!("SubFormat {:?}", (*desired_format_result).SubFormat);
+            */
         }
+
     }
     println!("done");
     Ok(())

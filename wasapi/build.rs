@@ -17,6 +17,7 @@ fn main() {
             ResetEvent,
             SetEvent,
             WAIT_RETURN_CAUSE,
+            WAIT_OBJECT_0,
             WaitForSingleObject,
             WaitForMultipleObjects,
         },
