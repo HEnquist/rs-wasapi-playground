@@ -37,8 +37,137 @@ use wasapi::{
 };
 use widestring::U16CString;
 use windows::Interface;
+use std::error;
 
-fn main() -> windows::Result<()> {
+type Res<T> = Result<T, Box<dyn error::Error>>;
+
+fn print_waveformat(wave_fmt: &WAVEFORMATEXTENSIBLE) {
+    unsafe {
+        println!("nAvgBytesPerSec {:?}", { wave_fmt.Format.nAvgBytesPerSec });
+        println!("cbSize {:?}", { wave_fmt.Format.cbSize });
+        println!("nBlockAlign {:?}", { wave_fmt.Format.nBlockAlign });
+        println!("wBitsPerSample {:?}", { wave_fmt.Format.wBitsPerSample });
+        println!("nSamplesPerSec {:?}", { wave_fmt.Format.nSamplesPerSec });
+        println!("wFormatTag {:?}", { wave_fmt.Format.wFormatTag });
+        println!("wValidBitsPerSample {:?}", { wave_fmt.Samples.wValidBitsPerSample });
+        println!("SubFormat {:?}", { wave_fmt.SubFormat });
+    }
+}
+
+fn make_waveformat(storebits: usize, validbits: usize, is_float: bool, samplerate: usize, channels: usize) -> WAVEFORMATEXTENSIBLE {
+    let blockalign = channels * storebits / 8;
+    let byterate = samplerate * blockalign;
+
+    let wave_format = WAVEFORMATEX {
+        cbSize: 22,
+        nAvgBytesPerSec: byterate as u32,
+        nBlockAlign: blockalign as u16, 
+        nChannels: channels as u16,
+        nSamplesPerSec: samplerate as u32,
+        wBitsPerSample: storebits as u16,
+        wFormatTag: WAVE_FORMAT_EXTENSIBLE as u16,
+    };
+    let sample = WAVEFORMATEXTENSIBLE_0 {
+        wValidBitsPerSample: validbits as u16,
+    };
+    let subformat = if is_float {
+        KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+    }
+    else {
+        KSDATAFORMAT_SUBTYPE_PCM
+    };
+    let mut mask = 0;
+    for n in 0..channels {
+        mask += 1<<n;
+    }
+    WAVEFORMATEXTENSIBLE {
+        Format: wave_format,
+        Samples: sample,
+        SubFormat: subformat,
+        dwChannelMask: mask,
+    }
+}
+
+fn get_iaudioclient(device: &IMMDevice) -> Res<IAudioClient> {
+    let mut audio_client: mem::MaybeUninit<IAudioClient> = mem::MaybeUninit::zeroed();
+    unsafe {
+        device
+            .Activate(
+                &IAudioClient::IID,
+                CLSCTX_ALL.0,
+                ptr::null_mut(),
+                audio_client.as_mut_ptr() as *mut _,
+            )
+            .ok()?;
+        Ok(audio_client.assume_init())
+    }
+}
+
+fn get_state(device: &IMMDevice) -> Res<u32> {
+    let mut state: u32 = 0;
+    unsafe  {
+        device.GetState(&mut state).ok()?;
+    }
+    println!("state: {:?}", state);
+    Ok(state)
+}
+
+fn get_friendlyname(device: &IMMDevice) -> Res<String> {
+    let mut store = None;
+    unsafe {
+        device
+            .OpenPropertyStore(STGM_READ as u32, &mut store)
+            .ok()?;
+    }
+    let mut prop: mem::MaybeUninit<PROPVARIANT> = mem::MaybeUninit::zeroed();
+    let mut propstr = PWSTR::NULL;
+    let store = store.ok_or("Failed to get store")?;
+    unsafe {
+        store
+            .GetValue(&PKEY_Device_FriendlyName, prop.as_mut_ptr())
+            .ok()?;
+        let prop = prop.assume_init();
+        PropVariantToStringAlloc(&prop, &mut propstr).ok()?;
+    }
+    let wide_name = unsafe { U16CString::from_ptr_str(propstr.0) };
+    let name =  wide_name.to_string_lossy();
+    println!("name: {}", name);
+    Ok(name)
+}
+
+fn get_id(device: &IMMDevice) -> Res<String> {
+    let mut idstr = PWSTR::NULL;
+    unsafe { 
+        device.GetId(&mut idstr).ok()?;
+    }
+    let wide_id = unsafe { U16CString::from_ptr_str(idstr.0) };
+    let id = wide_id.to_string_lossy();
+    println!("id: {}", id);
+    Ok(id)
+}
+
+fn is_supported_exclusive(audio_client: &IAudioClient, wave_fmt: &WAVEFORMATEXTENSIBLE) -> bool {
+    let supported = unsafe { audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wave_fmt as *const _ as *const WAVEFORMATEX, ptr::null_mut()) };
+    println!("supported {:?}\n", supported.ok());
+    supported.ok().is_ok()
+}
+
+fn is_supported_shared(audio_client: &IAudioClient, wave_fmt: &WAVEFORMATEXTENSIBLE) -> Res<WAVEFORMATEXTENSIBLE> {
+    let mut supported_format: mem::MaybeUninit<WAVEFORMATEXTENSIBLE> = mem::MaybeUninit::zeroed();
+    unsafe { audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, wave_fmt as *const _ as *const WAVEFORMATEX, &mut supported_format as *mut _ as *mut *mut WAVEFORMATEX).ok()? };
+    let supported_format = unsafe {supported_format.assume_init()};
+    Ok(supported_format)
+}
+
+fn get_periods(audio_client: &IAudioClient) -> Res<(i64, i64)> {
+    let mut def_time = 0;
+    let mut min_time = 0;
+    unsafe { audio_client.GetDevicePeriod(&mut def_time, &mut min_time).ok()? };
+    println!("default period {}, min period {}", def_time, min_time);
+    Ok((def_time, min_time))
+}
+
+fn main() -> Res<()> {
     unsafe {
         CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED).ok()?;
     }
@@ -75,169 +204,88 @@ fn main() -> windows::Result<()> {
             println!("{}", wide_string.to_string_lossy());
         }
     }
+
+    let mut devs = None;
     unsafe {
-        let mut devs = None;
         enumerator
             .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &mut devs)
             .ok()?;
-        let devs = devs.unwrap();
-        let mut count = 0;
-        devs.GetCount(&mut count).ok()?;
-        println!("nbr devices {}", count);
-        for n in 0..count {
-            let mut device = None;
-            devs.Item(n, &mut device).unwrap();
-            let device = device.unwrap();
-            let mut idstr = PWSTR::NULL;
-            device.GetId(&mut idstr).ok()?;
-            let wide_id = U16CString::from_ptr_str(idstr.0);
-            println!("id: {}", wide_id.to_string_lossy());
-            let mut store = None;
-            device
-                .OpenPropertyStore(STGM_READ as u32, &mut store)
-                .ok()?;
-            let mut state: u32 = 0;
-            device.GetState(&mut state).ok()?;
-            println!("state: {:?}", state);
-            let mut prop: mem::MaybeUninit<PROPVARIANT> = mem::MaybeUninit::zeroed();
-            let mut propstr = PWSTR::NULL;
-            store
-                .unwrap()
-                .GetValue(&PKEY_Device_FriendlyName, prop.as_mut_ptr())
-                .ok()?;
-            let prop = prop.assume_init();
-            PropVariantToStringAlloc(&prop, &mut propstr).ok()?;
-            let wide_name = U16CString::from_ptr_str(propstr.0);
-            println!("name: {}", wide_name.to_string_lossy());
+    }
+    let devs = devs.ok_or("Failed to get devices")?;
+    let mut count = 0;
+    unsafe  { devs.GetCount(&mut count).ok()? };
+    println!("nbr devices {}", count);
+    for n in 0..count {
+        let mut device = None;
+        unsafe { devs.Item(n, &mut device).ok()? };
+        let device = device.ok_or("Failed to get device")?;
+        let name = get_friendlyname(&device)?;
+        let state = get_state(&device)?;
+        let id = get_id(&device)?;
 
-            let mut audio_client: mem::MaybeUninit<IAudioClient> = mem::MaybeUninit::zeroed();
+        let audio_client = get_iaudioclient(&device)?;
 
-            device
-                .Activate(
-                    &IAudioClient::IID,
-                    CLSCTX_ALL.0,
-                    ptr::null_mut(),
-                    audio_client.as_mut_ptr() as *mut _,
-                )
-                .ok()?;
+        let desired_format_ex = make_waveformat(16, 16, false, 48000, 2);
+        let blockalign = {desired_format_ex.Format.nBlockAlign } as u32;
+        print_waveformat(&desired_format_ex);
 
-            let audio_client = audio_client.assume_init();
-            //let mut desired_format = mem::MaybeUninit::<*mut WAVEFORMATEXTENSIBLE>::zeroed();
-            let bits = 16;
-            let validbits = 16;
-            let srate = 48000;
-            let channels = 2;
-            let blockalign = channels * bits / 8;
-            let byterate = srate * blockalign;
+        let supported = is_supported_exclusive(&audio_client, &desired_format_ex);
+        println!("supported {:?}\n", supported);
 
-            let desired_format = WAVEFORMATEX {
-                cbSize: 22,
-                nAvgBytesPerSec: byterate,
-                nBlockAlign: blockalign as u16, 
-                nChannels: channels as u16,
-                nSamplesPerSec: srate,
-                wBitsPerSample: bits as u16,
-                wFormatTag: WAVE_FORMAT_EXTENSIBLE as u16,
-            };
-            let sample = WAVEFORMATEXTENSIBLE_0 {
-                wValidBitsPerSample: validbits,
-            };
-            let desired_format_ex = WAVEFORMATEXTENSIBLE {
-                Format: desired_format,
-                Samples: sample,
-                SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
-                dwChannelMask: 3,
-            };
-            println!("nAvgBytesPerSec {:?}", { desired_format_ex.Format.nAvgBytesPerSec });
-            println!("cbSize {:?}", { desired_format_ex.Format.cbSize });
-            println!("nBlockAlign {:?}", { desired_format_ex.Format.nBlockAlign });
-            println!("wBitsPerSample {:?}", { desired_format_ex.Format.wBitsPerSample });
-            println!("nSamplesPerSec {:?}", { desired_format_ex.Format.nSamplesPerSec });
-            println!("wFormatTag {:?}", { desired_format_ex.Format.wFormatTag });
-            println!("wValidBitsPerSample {:?}", { desired_format_ex.Samples.wValidBitsPerSample });
-            println!("SubFormat {:?}", { desired_format_ex.SubFormat });
+        let (def_time, min_time) = get_periods(&audio_client)?;
+        println!("default period {}, min period {}", def_time, min_time);
 
+        unsafe {
+            audio_client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                def_time,
+                def_time,
+                &desired_format_ex as *const _ as *const WAVEFORMATEX,
+                std::ptr::null()).ok()?
+        };
 
-            let desired_format_simple = WAVEFORMATEX {
-                cbSize: 0,
-                nAvgBytesPerSec: byterate,
-                nBlockAlign: blockalign as u16, 
-                nChannels: channels as u16,
-                nSamplesPerSec: srate,
-                wBitsPerSample: bits as u16,
-                wFormatTag: WAVE_FORMAT_PCM as u16,
-            };
+        let h_event = unsafe { CreateEventA(std::ptr::null_mut(), false, false, PSTR::default()) };
 
-            let supported = audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, &desired_format_ex as *const _ as *const WAVEFORMATEX, ptr::null_mut());
-            println!("supported {:?}\n", supported.ok());
-
-            let mut def_time = 0;
-            let mut min_time = 0;
-            let res = audio_client.GetDevicePeriod(&mut def_time, &mut min_time);
-            println!("result {:?}", res.ok());
-            println!("default period {}, min period {}", def_time, min_time);
-
-
-            let res = audio_client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                    def_time,
-                    def_time,
-                    &desired_format_ex as *const _ as *const WAVEFORMATEX,
-                    std::ptr::null());
-            println!("result {:?}", res.ok());
-
-            let h_event = CreateEventA(std::ptr::null_mut(), false, false, PSTR::default());
-
-            let hr = audio_client.SetEventHandle(h_event);
-            println!("result {:?}", hr.ok());
+        unsafe { audio_client.SetEventHandle(h_event).ok()? };
             
-            let mut bufferFrameCount = 0;
-            let hr = audio_client.GetBufferSize(&mut bufferFrameCount);
-            println!("result {:?}", hr.ok());
-            println!("bufferFrameCount {}",bufferFrameCount);
+        let mut bufferFrameCount = 0;
+        unsafe { audio_client.GetBufferSize(&mut bufferFrameCount).ok()? };
+        println!("bufferFrameCount {}",bufferFrameCount);
 
-            let render_client: IAudioRenderClient = audio_client.GetService()?;
+        let render_client: IAudioRenderClient = unsafe { audio_client.GetService()? };
 
-            let hr = audio_client.Start();
-            println!("result {:?}", hr.ok());
+        unsafe { audio_client.Start().ok()? };
 
-            for n in 0..128 {
-                let mut data = mem::MaybeUninit::uninit();
+        for n in 0..20 {
+            let mut data = mem::MaybeUninit::uninit();
+            unsafe { 
                 render_client
                     .GetBuffer(bufferFrameCount, data.as_mut_ptr())
-                    .ok()?;
+                    .ok()?
+            };
 
-                let mut dataptr = data.assume_init();
-                let mut databuf = slice::from_raw_parts_mut(dataptr, (bufferFrameCount*blockalign) as usize);
-                for m in 0..bufferFrameCount*blockalign/2 {
-                    databuf[m as usize] = 10;
-                }
-                render_client.ReleaseBuffer(bufferFrameCount, 0);
-                println!("wrote frames");
+            let mut dataptr = unsafe { data.assume_init() };
+            let mut databuf = unsafe { slice::from_raw_parts_mut(dataptr, (bufferFrameCount*blockalign) as usize) };
+            for m in 0..bufferFrameCount*blockalign/2 {
+                databuf[m as usize] = 10;
+            }
+            unsafe { render_client.ReleaseBuffer(bufferFrameCount, 0) };
+            println!("wrote frames");
 
-                let retval = WaitForSingleObject(h_event, 100);
-                if (retval != WAIT_OBJECT_0)
-                {
-                    // Event handle timed out after a 2-second wait.
-                    audio_client.Stop();
-                    break;
-                }
-
+            let retval = unsafe { WaitForSingleObject(h_event, 100) };
+            if (retval != WAIT_OBJECT_0)
+            {
+                // Event handle timed out after a 2-second wait.
+                unsafe { audio_client.Stop() };
+                break;
             }
 
-            /*
-            let mut desired_format_result: *mut WAVEFORMATEXTENSIBLE = ptr::null_mut();
-            let supported = audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, &desired_format_ex as *const _ as *const WAVEFORMATEX, &mut desired_format_result as *mut _ as *mut *mut WAVEFORMATEX);
-            println!("nAvgBytesPerSec {:?}", (*desired_format_result).Format.nAvgBytesPerSec);
-            println!("cbSize {:?}", (*desired_format_result).Format.cbSize);
-            println!("nBlockAlign {:?}", (*desired_format_result).Format.nBlockAlign);
-            println!("wBitsPerSample {:?}", (*desired_format_result).Format.wBitsPerSample);
-            println!("nSamplesPerSec {:?}", (*desired_format_result).Format.nSamplesPerSec);
-            println!("wFormatTag {:?}", (*desired_format_result).Format.wFormatTag);
-            println!("wValidBitsPerSample {:?}", (*desired_format_result).Samples.wValidBitsPerSample);
-            println!("SubFormat {:?}", (*desired_format_result).SubFormat);
-            */
         }
+
+        /*
+        let mut desired_format_result: *mut WAVEFORMATEXTENSIBLE = ptr::null_mut();
+        let supported = audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, &desired_format_ex as *const _ as *const WAVEFORMATEX, &mut desired_format_result as *mut _ as *mut *mut WAVEFORMATEX);
+        */
 
     }
     println!("done");
