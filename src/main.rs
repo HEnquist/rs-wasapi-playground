@@ -1,10 +1,11 @@
 use std::mem;
 use std::ptr;
 use std::slice;
+use std::fmt;
 use wasapi::{
     PKEY_Device_FriendlyName,
     Windows::Win32::Media::Audio::CoreAudio::{
-        eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+        eConsole, eRender, eCapture, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, IMMDeviceCollection,
         AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE, WAVE_FORMAT_EXTENSIBLE,
     },
     Windows::Win32::Media::Multimedia::{
@@ -38,6 +39,31 @@ use wasapi::{
 use widestring::U16CString;
 use windows::Interface;
 use std::error;
+
+#[derive(Debug)]
+pub struct WasapiError {
+    desc: String,
+}
+
+impl fmt::Display for WasapiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.desc)
+    }
+}
+
+impl error::Error for WasapiError {
+    fn description(&self) -> &str {
+        &self.desc
+    }
+}
+
+impl WasapiError {
+    pub fn new(desc: &str) -> Self {
+        WasapiError {
+            desc: desc.to_owned(),
+        }
+    }
+}
 
 type Res<T> = Result<T, Box<dyn error::Error>>;
 
@@ -167,6 +193,39 @@ fn get_periods(audio_client: &IAudioClient) -> Res<(i64, i64)> {
     Ok((def_time, min_time))
 }
 
+fn get_devices(capture: bool) -> Res<IMMDeviceCollection> {
+    let direction = if capture {
+        eCapture
+    }
+    else {
+        eRender
+    };
+    let enumerator: IMMDeviceEnumerator = windows::create_instance(&MMDeviceEnumerator)?;
+    let mut devs = None;
+    unsafe {
+        enumerator
+            .EnumAudioEndpoints(direction, DEVICE_STATE_ACTIVE, &mut devs)
+            .ok()?;
+    }
+    devs.ok_or(WasapiError::new("Failed to get devices").into())
+}
+
+fn get_device_with_name(devices: &IMMDeviceCollection, name: &str) -> Res<IMMDevice> {
+    let mut count = 0;
+    unsafe  { devices.GetCount(&mut count).ok()? };
+    println!("nbr devices {}", count);
+    for n in 0..count {
+        let mut device = None;
+        unsafe { devices.Item(n, &mut device).ok()? };
+        let device = device.ok_or("Failed to get device")?;
+        let devname = get_friendlyname(&device)?;
+        if name == devname {
+            return Ok(device)
+        }
+    }
+    Err(WasapiError::new(format!("Unable to find device {}", name).as_str()).into())
+}
+
 fn main() -> Res<()> {
     unsafe {
         CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED).ok()?;
@@ -205,13 +264,7 @@ fn main() -> Res<()> {
         }
     }
 
-    let mut devs = None;
-    unsafe {
-        enumerator
-            .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &mut devs)
-            .ok()?;
-    }
-    let devs = devs.ok_or("Failed to get devices")?;
+    let devs = get_devices(false)?;
     let mut count = 0;
     unsafe  { devs.GetCount(&mut count).ok()? };
     println!("nbr devices {}", count);
@@ -288,6 +341,7 @@ fn main() -> Res<()> {
         */
 
     }
+    let device = get_device_with_name(&devs, "SPDIF Interface (FX-AUDIO-DAC-X6)")?;
     println!("done");
     Ok(())
 }
