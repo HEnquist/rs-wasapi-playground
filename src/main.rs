@@ -15,45 +15,12 @@ type Res<T> = Result<T, Box<dyn error::Error>>;
 
 fn main() -> Res<()> {
     initialize_mta()?;
-    /*
-    let mut device = None;
-    let enumerator: IMMDeviceEnumerator = windows::create_instance(&MMDeviceEnumerator)?;
-    unsafe {
-        enumerator
-            .GetDefaultAudioEndpoint(eRender, eConsole, &mut device)
-            .ok()?;
-        println!("{:?}", device);
-
-        if let Some(device) = device {
-            println!("{:?}", device);
-            let mut store = None;
-            device
-                .OpenPropertyStore(STGM_READ as u32, &mut store)
-                .ok()?;
-            let mut state: u32 = 0;
-            device.GetState(&mut state).ok()?;
-            println!("{:?}", state);
-            let mut prop: mem::MaybeUninit<PROPVARIANT> = mem::MaybeUninit::zeroed();
-            let mut propstr = PWSTR::NULL;
-            println!("read prop into {:?}", propstr);
-            store
-                .unwrap()
-                .GetValue(&PKEY_Device_FriendlyName, prop.as_mut_ptr())
-                .ok()?;
-            let prop = prop.assume_init();
-            println!("read prop");
-            PropVariantToStringAlloc(&prop, &mut propstr).ok()?;
-            // Get the buffer as a wide string
-            let wide_string = U16CString::from_ptr_str(propstr.0);
-            //let name = PWSTR::try_from(prop);
-            println!("{}", wide_string.to_string_lossy());
-        }
-    }
-    */
     let blockalign = 4;
-    let (tx_dev, rx_dev): (std::sync::mpsc::SyncSender<Vec<u8>>, std::sync::mpsc::Receiver<Vec<u8>>) = mpsc::sync_channel(2);
+    let (tx_play, rx_play): (std::sync::mpsc::SyncSender<Vec<u8>>, std::sync::mpsc::Receiver<Vec<u8>>) = mpsc::sync_channel(2);
+    let (tx_capt, rx_capt): (std::sync::mpsc::SyncSender<Vec<u8>>, std::sync::mpsc::Receiver<Vec<u8>>) = mpsc::sync_channel(2);
     let buffer_fill = Arc::new(AtomicUsize::new(0));
     let buffer_fill_clone = buffer_fill.clone();
+    let chunksize = 1024;
     
     // Playback
     let _handle = thread::Builder::new()
@@ -88,7 +55,7 @@ fn main() -> Res<()> {
                 while sample_queue.len() < (blockalign as usize * buffer_frame_count as usize) {
                     println!("need more samples");
                     
-                    match rx_dev.recv_timeout(time::Duration::from_micros(1000)) {
+                    match rx_play.recv_timeout(time::Duration::from_micros(100000)) {
                         Ok(chunk) => {
                             println!("got chunk");
                             for element in chunk.iter() {
@@ -113,16 +80,60 @@ fn main() -> Res<()> {
             }
         });
 
-    let mut timeval: usize = 0;
-    for _n in 0..100 {
-        let mut databuf = vec![0u8; (1024*blockalign) as usize];
-        for m in 0..databuf.len() {
-            databuf[m] = ((timeval%256)>128) as u8 * 10;
-            timeval += 1;
+    // Capture
+    let _handle = thread::Builder::new()
+        .name("Capture".to_string())
+        .spawn(move || {
+            let collection = DeviceCollection::new(true).unwrap();
+            let device = collection.get_device_with_name("CABLE Output (VB-Audio Virtual Cable)").unwrap();
+            let audio_client = device.get_iaudioclient().unwrap();
+
+            let desired_format_ex = WaveFormat::new(16, 16, false, 48000, 2);
+            let blockalign = desired_format_ex.get_blockalign();
+            desired_format_ex.print_waveformat();
+
+            let supported = audio_client.is_supported_exclusive(&desired_format_ex);
+            println!("supported {:?}\n", supported);
+
+            let (def_time, min_time) = audio_client.get_periods().unwrap();
+            println!("default period {}, min period {}", def_time, min_time);
+
+
+            audio_client.initialize_client(&desired_format_ex, def_time as i64).unwrap();
+
+            let h_event = audio_client.set_get_eventhandle().unwrap();
+
+            let buffer_frame_count = audio_client.get_bufferframecount().unwrap();
+
+            let render_client = audio_client.get_audiocaptureclient().unwrap();
+            let mut sample_queue: VecDeque<u8> = VecDeque::with_capacity(100*blockalign as usize * (1024 + 2*buffer_frame_count as usize));
+            audio_client.start_stream().unwrap();
+            loop {
+                //println!("deque len {}", sample_queue.len());
+                while sample_queue.len() > (blockalign as usize * chunksize as usize) {
+                    println!("pushing samples");
+                    let mut chunk = vec![0u8; blockalign as usize * chunksize as usize];
+                    for element in chunk.iter_mut() {
+                        *element = sample_queue.pop_front().unwrap();
+                    }
+                    tx_capt.send(chunk).unwrap();
+                }
+                render_client.read_from_device_to_deque(blockalign as usize, &mut sample_queue).unwrap();
+                if h_event.wait_for_event(10000).is_err() {
+                    audio_client.stop_stream().unwrap();
+                    break;
+                }
+            }
+        });
+
+    for _n in 0..1000 {
+        match rx_capt.recv() {
+            Ok(chunk) => {
+                println!("sending");
+                tx_play.send(chunk).unwrap();
+            },
+            Err(err) => println!("Some error {}", err),
         }
-        println!("sending");
-        tx_dev.send(databuf).unwrap();
-        
     }
     //let device = get_device_with_name(&devs, "SPDIF Interface (FX-AUDIO-DAC-X6)")?;
     println!("done");

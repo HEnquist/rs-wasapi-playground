@@ -9,7 +9,7 @@ use std::error;
 use crate::{
     PKEY_Device_FriendlyName,
     Windows::Win32::Media::Audio::CoreAudio::{
-        eRender, eCapture, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, IMMDeviceCollection,
+        eConsole, eRender, eCapture, IAudioClient, IAudioRenderClient, IAudioCaptureClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, IMMDeviceCollection,
         AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE, WAVE_FORMAT_EXTENSIBLE,
     },
     Windows::Win32::Media::Multimedia::{
@@ -55,6 +55,28 @@ impl WasapiError {
         WasapiError {
             desc: desc.to_owned(),
         }
+    }
+}
+
+// Get the default playback or capture device
+pub fn get_default_device(capture: bool) -> Res<Device> {
+    let direction = if capture {
+        eCapture
+    }
+    else {
+        eRender
+    };
+    let mut device = None;
+    let enumerator: IMMDeviceEnumerator = windows::create_instance(&MMDeviceEnumerator)?;
+    unsafe {
+        enumerator
+            .GetDefaultAudioEndpoint(direction, eConsole, &mut device)
+            .ok()?;
+        println!("{:?}", device);
+    }
+    match device {
+        Some(dev) => Ok(Device{ device: dev}),
+        None => Err(WasapiError::new("Failed to get default device").into()),
     }
 }
 
@@ -264,6 +286,14 @@ impl AudioClient {
             None => Err(WasapiError::new("Failed getting IAudioRenderClient").into()),
         }
     }
+
+    pub fn get_audiocaptureclient(&self) -> Res<AudioCaptureClient> {
+        let renderclient: Option<IAudioCaptureClient> = unsafe { self.client.GetService().ok() };
+        match renderclient {
+            Some(client) => Ok(AudioCaptureClient {client}),
+            None => Err(WasapiError::new("Failed getting IAudioCaptureClient").into()),
+        }
+    }
 }
 
 pub struct AudioRenderClient {
@@ -309,6 +339,61 @@ impl AudioRenderClient {
             *element = data.pop_front().unwrap();
         }
         unsafe { self.client.ReleaseBuffer(nbr_frames as u32, 0).ok()? };
+        //println!("wrote frames");
+        Ok(())
+    }
+}
+
+pub struct AudioCaptureClient {
+    client: IAudioCaptureClient,
+}
+
+impl AudioCaptureClient {
+    // Get number of frames in next packet, only works in shared mode
+    pub fn get_next_nbr_frames(&self) -> Res<u32> {
+        let mut nbr_frames = 0;
+        unsafe {self.client.GetNextPacketSize(&mut nbr_frames).ok()?};
+        Ok(nbr_frames)
+    }
+
+    // Read raw bytes data from a device into a slice
+    pub fn read_from_device(&self, bytes_per_frame: usize, data: &mut [u8]) -> Res<()> {
+        let data_len_in_frames = data.len() / bytes_per_frame;
+        let mut buffer = mem::MaybeUninit::uninit();
+        let mut nbr_frames_returned = 0;
+        unsafe { 
+            self.client
+                .GetBuffer(buffer.as_mut_ptr(), &mut nbr_frames_returned, &mut 0, ptr::null_mut(), ptr::null_mut())
+                .ok()?
+        };
+        if data_len_in_frames != nbr_frames_returned as usize {
+            return Err(WasapiError::new(format!("Wrong length of data, got {} frames, expected {} frames", data_len_in_frames, nbr_frames_returned).as_str()).into());
+        }
+        let len_in_bytes = nbr_frames_returned as usize * bytes_per_frame;
+        let bufferptr = unsafe { buffer.assume_init() };
+        let bufferslice = unsafe { slice::from_raw_parts(bufferptr, len_in_bytes) };
+        data.copy_from_slice(bufferslice);
+        unsafe { self.client.ReleaseBuffer(nbr_frames_returned).ok()? };
+        println!("wrote frames");
+        Ok(())
+    }
+
+    // Write raw bytes data to a device from a deque
+    pub fn read_from_device_to_deque(&self, bytes_per_frame: usize, data: &mut VecDeque<u8>) -> Res<()> {
+        let mut buffer = mem::MaybeUninit::uninit();
+        let mut nbr_frames_returned = 0;
+        unsafe { 
+            self.client
+                .GetBuffer(buffer.as_mut_ptr(), &mut nbr_frames_returned, &mut 0, ptr::null_mut(), ptr::null_mut())
+                .ok()?
+        };
+        let len_in_bytes = nbr_frames_returned as usize * bytes_per_frame;
+        let bufferptr = unsafe { buffer.assume_init() };
+        let bufferslice = unsafe { slice::from_raw_parts(bufferptr, len_in_bytes) };
+        for element in bufferslice.iter() {
+            data.push_back(*element);
+        }
+        unsafe { self.client.ReleaseBuffer(nbr_frames_returned).ok()? };
         //println!("wrote frames");
         Ok(())
     }
