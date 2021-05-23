@@ -1,311 +1,21 @@
-use std::mem;
-use std::ptr;
-use std::slice;
-use std::fmt;
-use wasapi::{
-    PKEY_Device_FriendlyName,
-    Windows::Win32::Media::Audio::CoreAudio::{
-        eConsole, eRender, eCapture, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, IMMDeviceCollection,
-        AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE, WAVE_FORMAT_EXTENSIBLE,
-    },
-    Windows::Win32::Media::Multimedia::{
-        WAVEFORMATEX,
-        WAVEFORMATEXTENSIBLE,
-        WAVEFORMATEXTENSIBLE_0,
-        WAVE_FORMAT_PCM,
-        WAVE_FORMAT_IEEE_FLOAT,
-        KSDATAFORMAT_SUBTYPE_PCM,
-        KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
-    },
-    Windows::Win32::Storage::StructuredStorage::PROPVARIANT,
-    Windows::Win32::Storage::StructuredStorage::STGM_READ,
-    Windows::Win32::System::Com::{
-        CLSIDFromProgID, CoInitializeEx, CoTaskMemAlloc, CoTaskMemFree, CLSCTX, CLSCTX_ALL,
-        COINIT_MULTITHREADED,
-    },
-    Windows::Win32::System::PropertiesSystem::PropVariantToStringAlloc,
-    Windows::Win32::System::PropertiesSystem::PROPERTYKEY,
-    Windows::Win32::System::SystemServices::{PSTR, PWSTR, HANDLE},
-    Windows::Win32::System::Threading::{
-        CreateEventA,
-        ResetEvent,
-        SetEvent,
-        WAIT_RETURN_CAUSE,
-        WAIT_OBJECT_0,
-        WaitForSingleObject,
-        WaitForMultipleObjects,
-    },
-};
-use widestring::U16CString;
-use windows::Interface;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Barrier, RwLock};
+use std::thread;
+use std::time;
+
+use windows::initialize_mta;
 use std::error;
+use wasapi::wasapi::*;
 
-#[derive(Debug)]
-pub struct WasapiError {
-    desc: String,
-}
-
-impl fmt::Display for WasapiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.desc)
-    }
-}
-
-impl error::Error for WasapiError {
-    fn description(&self) -> &str {
-        &self.desc
-    }
-}
-
-impl WasapiError {
-    pub fn new(desc: &str) -> Self {
-        WasapiError {
-            desc: desc.to_owned(),
-        }
-    }
-}
 
 type Res<T> = Result<T, Box<dyn error::Error>>;
 
-fn print_waveformat(wave_fmt: &WAVEFORMATEXTENSIBLE) {
-    unsafe {
-        println!("nAvgBytesPerSec {:?}", { wave_fmt.Format.nAvgBytesPerSec });
-        println!("cbSize {:?}", { wave_fmt.Format.cbSize });
-        println!("nBlockAlign {:?}", { wave_fmt.Format.nBlockAlign });
-        println!("wBitsPerSample {:?}", { wave_fmt.Format.wBitsPerSample });
-        println!("nSamplesPerSec {:?}", { wave_fmt.Format.nSamplesPerSec });
-        println!("wFormatTag {:?}", { wave_fmt.Format.wFormatTag });
-        println!("wValidBitsPerSample {:?}", { wave_fmt.Samples.wValidBitsPerSample });
-        println!("SubFormat {:?}", { wave_fmt.SubFormat });
-    }
-}
-
-fn make_waveformat(storebits: usize, validbits: usize, is_float: bool, samplerate: usize, channels: usize) -> WAVEFORMATEXTENSIBLE {
-    let blockalign = channels * storebits / 8;
-    let byterate = samplerate * blockalign;
-
-    let wave_format = WAVEFORMATEX {
-        cbSize: 22,
-        nAvgBytesPerSec: byterate as u32,
-        nBlockAlign: blockalign as u16, 
-        nChannels: channels as u16,
-        nSamplesPerSec: samplerate as u32,
-        wBitsPerSample: storebits as u16,
-        wFormatTag: WAVE_FORMAT_EXTENSIBLE as u16,
-    };
-    let sample = WAVEFORMATEXTENSIBLE_0 {
-        wValidBitsPerSample: validbits as u16,
-    };
-    let subformat = if is_float {
-        KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-    }
-    else {
-        KSDATAFORMAT_SUBTYPE_PCM
-    };
-    let mut mask = 0;
-    for n in 0..channels {
-        mask += 1<<n;
-    }
-    WAVEFORMATEXTENSIBLE {
-        Format: wave_format,
-        Samples: sample,
-        SubFormat: subformat,
-        dwChannelMask: mask,
-    }
-}
-
-fn get_iaudioclient(device: &IMMDevice) -> Res<IAudioClient> {
-    let mut audio_client: mem::MaybeUninit<IAudioClient> = mem::MaybeUninit::zeroed();
-    unsafe {
-        device
-            .Activate(
-                &IAudioClient::IID,
-                CLSCTX_ALL.0,
-                ptr::null_mut(),
-                audio_client.as_mut_ptr() as *mut _,
-            )
-            .ok()?;
-        Ok(audio_client.assume_init())
-    }
-}
-
-fn get_state(device: &IMMDevice) -> Res<u32> {
-    let mut state: u32 = 0;
-    unsafe  {
-        device.GetState(&mut state).ok()?;
-    }
-    println!("state: {:?}", state);
-    Ok(state)
-}
-
-fn get_friendlyname(device: &IMMDevice) -> Res<String> {
-    let mut store = None;
-    unsafe {
-        device
-            .OpenPropertyStore(STGM_READ as u32, &mut store)
-            .ok()?;
-    }
-    let mut prop: mem::MaybeUninit<PROPVARIANT> = mem::MaybeUninit::zeroed();
-    let mut propstr = PWSTR::NULL;
-    let store = store.ok_or("Failed to get store")?;
-    unsafe {
-        store
-            .GetValue(&PKEY_Device_FriendlyName, prop.as_mut_ptr())
-            .ok()?;
-        let prop = prop.assume_init();
-        PropVariantToStringAlloc(&prop, &mut propstr).ok()?;
-    }
-    let wide_name = unsafe { U16CString::from_ptr_str(propstr.0) };
-    let name =  wide_name.to_string_lossy();
-    println!("name: {}", name);
-    Ok(name)
-}
-
-fn get_id(device: &IMMDevice) -> Res<String> {
-    let mut idstr = PWSTR::NULL;
-    unsafe { 
-        device.GetId(&mut idstr).ok()?;
-    }
-    let wide_id = unsafe { U16CString::from_ptr_str(idstr.0) };
-    let id = wide_id.to_string_lossy();
-    println!("id: {}", id);
-    Ok(id)
-}
-
-fn is_supported_exclusive(audio_client: &IAudioClient, wave_fmt: &WAVEFORMATEXTENSIBLE) -> bool {
-    let supported = unsafe { audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wave_fmt as *const _ as *const WAVEFORMATEX, ptr::null_mut()) };
-    println!("supported {:?}\n", supported.ok());
-    supported.ok().is_ok()
-}
-
-fn is_supported_shared(audio_client: &IAudioClient, wave_fmt: &WAVEFORMATEXTENSIBLE) -> Res<WAVEFORMATEXTENSIBLE> {
-    let mut supported_format: mem::MaybeUninit<WAVEFORMATEXTENSIBLE> = mem::MaybeUninit::zeroed();
-    unsafe { audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, wave_fmt as *const _ as *const WAVEFORMATEX, &mut supported_format as *mut _ as *mut *mut WAVEFORMATEX).ok()? };
-    let supported_format = unsafe {supported_format.assume_init()};
-    Ok(supported_format)
-}
-
-fn get_periods(audio_client: &IAudioClient) -> Res<(i64, i64)> {
-    let mut def_time = 0;
-    let mut min_time = 0;
-    unsafe { audio_client.GetDevicePeriod(&mut def_time, &mut min_time).ok()? };
-    println!("default period {}, min period {}", def_time, min_time);
-    Ok((def_time, min_time))
-}
-
-fn get_devices(capture: bool) -> Res<IMMDeviceCollection> {
-    let direction = if capture {
-        eCapture
-    }
-    else {
-        eRender
-    };
-    let enumerator: IMMDeviceEnumerator = windows::create_instance(&MMDeviceEnumerator)?;
-    let mut devs = None;
-    unsafe {
-        enumerator
-            .EnumAudioEndpoints(direction, DEVICE_STATE_ACTIVE, &mut devs)
-            .ok()?;
-    }
-    devs.ok_or(WasapiError::new("Failed to get devices").into())
-}
-
-fn get_nbr_devices(devices: &IMMDeviceCollection) -> Res<u32> {
-    let mut count = 0;
-    unsafe  { devices.GetCount(&mut count).ok()? };
-    Ok(count)
-}
-
-
-fn get_device_at_index(devices: &IMMDeviceCollection, idx: u32) -> Res<IMMDevice> {
-    let mut device = None;
-    unsafe { devices.Item(idx, &mut device).ok()? };
-    device.ok_or(WasapiError::new("Failed to get device").into())
-}
-
-fn get_device_with_name(devices: &IMMDeviceCollection, name: &str) -> Res<IMMDevice> {
-    let mut count = 0;
-    unsafe  { devices.GetCount(&mut count).ok()? };
-    println!("nbr devices {}", count);
-    for n in 0..count {
-        let mut device = None;
-        unsafe { devices.Item(n, &mut device).ok()? };
-        let device = device.ok_or("Failed to get device")?;
-        let devname = get_friendlyname(&device)?;
-        if name == devname {
-            return Ok(device)
-        }
-    }
-    Err(WasapiError::new(format!("Unable to find device {}", name).as_str()).into())
-}
-
-fn initialize_client(audio_client: &IAudioClient, wavefmt: &WAVEFORMATEXTENSIBLE, period: i64) -> Res<()> {
-    unsafe {
-        audio_client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            period,
-            period,
-            wavefmt as *const _ as *const WAVEFORMATEX,
-            std::ptr::null()).ok()?;
-    }
-    Ok(())
-}
-
-fn set_get_eventhandle(audio_client: &IAudioClient) -> Res<HANDLE> {
-    let h_event = unsafe { CreateEventA(std::ptr::null_mut(), false, false, PSTR::default()) };
-    unsafe { audio_client.SetEventHandle(h_event).ok()? };
-    Ok(h_event)
-}
-
-fn get_bufferframecount(audio_client: &IAudioClient) -> Res<u32> {
-    let mut bufferFrameCount = 0;
-    unsafe { audio_client.GetBufferSize(&mut bufferFrameCount).ok()? };
-    println!("bufferFrameCount {}",bufferFrameCount);
-    Ok(bufferFrameCount)
-}
-
-fn write_to_device(render_client: &IAudioRenderClient, nbr_frames: usize, byte_per_frame: usize, data: &[u8]) -> Res<()> {
-    let nbr_bytes = nbr_frames * byte_per_frame;
-    if nbr_bytes != data.len() {
-        return Err(WasapiError::new(format!("Wrong length of data, got {}, expected {}", data.len(), nbr_bytes).as_str()).into());
-    }
-    let mut buffer = mem::MaybeUninit::uninit();
-    unsafe { 
-        render_client
-            .GetBuffer(nbr_frames as u32, buffer.as_mut_ptr())
-            .ok()?
-    };
-    let mut bufferptr = unsafe { buffer.assume_init() };
-    let mut bufferslice = unsafe { slice::from_raw_parts_mut(bufferptr, nbr_bytes) };
-    bufferslice.copy_from_slice(data);
-    unsafe { render_client.ReleaseBuffer(nbr_frames as u32, 0) };
-    println!("wrote frames");
-    Ok(())
-}
-
-fn wait_for_event(h_event: &HANDLE, timeout_ms: u32) -> Res<()> {
-    let retval = unsafe { WaitForSingleObject(h_event, timeout_ms) };
-    if (retval != WAIT_OBJECT_0)
-    {
-        return Err(WasapiError::new(format!("Wait timed out").as_str()).into());
-    }
-    Ok(())
-}
-
-fn start_stream(audio_client: &IAudioClient) -> Res<()> {
-    unsafe { audio_client.Start().ok()? };
-    Ok(())
-}
-
-fn stop_stream(audio_client: &IAudioClient) -> Res<()> {
-    unsafe { audio_client.Stop().ok()? };
-    Ok(())
-}
 
 fn main() -> Res<()> {
-    unsafe {
-        CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED).ok()?;
-    }
+    initialize_mta()?;
+    /*
     let mut device = None;
     let enumerator: IMMDeviceEnumerator = windows::create_instance(&MMDeviceEnumerator)?;
     unsafe {
@@ -339,56 +49,82 @@ fn main() -> Res<()> {
             println!("{}", wide_string.to_string_lossy());
         }
     }
+    */
+    let blockalign = 4;
+    let (tx_dev, rx_dev): (std::sync::mpsc::SyncSender<Vec<u8>>, std::sync::mpsc::Receiver<Vec<u8>>) = mpsc::sync_channel(2);
+    let buffer_fill = Arc::new(AtomicUsize::new(0));
+    let buffer_fill_clone = buffer_fill.clone();
+    
+    // Playback
+    let _handle = thread::Builder::new()
+        .name("Player".to_string())
+        .spawn(move || {
+            let collection = DeviceCollection::new(false).unwrap();
+            let device = collection.get_device_with_name("SPDIF Interface (FX-AUDIO-DAC-X6)").unwrap();
+            let audio_client = device.get_iaudioclient().unwrap();
 
-    let devs = get_devices(false)?;
-    let count = get_nbr_devices(&devs)?;
-    println!("nbr devices {}", count);
-    for n in 0..count {
-        let device = get_device_at_index(&devs, n)?;
-        let name = get_friendlyname(&device)?;
-        let state = get_state(&device)?;
-        let id = get_id(&device)?;
+            let desired_format_ex = WaveFormat::new(16, 16, false, 48000, 2);
+            let blockalign = desired_format_ex.get_blockalign();
+            desired_format_ex.print_waveformat();
 
-        let audio_client = get_iaudioclient(&device)?;
+            let supported = audio_client.is_supported_exclusive(&desired_format_ex);
+            println!("supported {:?}\n", supported);
 
-        let desired_format_ex = make_waveformat(16, 16, false, 48000, 2);
-        let blockalign = {desired_format_ex.Format.nBlockAlign } as u32;
-        print_waveformat(&desired_format_ex);
-
-        let supported = is_supported_exclusive(&audio_client, &desired_format_ex);
-        println!("supported {:?}\n", supported);
-
-        let (def_time, min_time) = get_periods(&audio_client)?;
-        println!("default period {}, min period {}", def_time, min_time);
+            let (def_time, min_time) = audio_client.get_periods().unwrap();
+            println!("default period {}, min period {}", def_time, min_time);
 
 
-        initialize_client(&audio_client, &desired_format_ex, def_time as i64)?;
+            audio_client.initialize_client(&desired_format_ex, def_time as i64).unwrap();
 
-        let h_event = set_get_eventhandle(&audio_client)?;
-            
-        let bufferFrameCount = get_bufferframecount(&audio_client)?;
+            let h_event = audio_client.set_get_eventhandle().unwrap();
 
-        let render_client: IAudioRenderClient = unsafe { audio_client.GetService()? };
+            let buffer_frame_count = audio_client.get_bufferframecount().unwrap();
 
-        start_stream(&audio_client);
+            let render_client = audio_client.get_audiorenderclient().unwrap();
+            let mut sample_queue: VecDeque<u8> = VecDeque::with_capacity(100*blockalign as usize * (1024 + 2*buffer_frame_count as usize));
+            audio_client.start_stream().unwrap();
+            loop {
+                //println!("deque len {}", sample_queue.len());
+                while sample_queue.len() < (blockalign as usize * buffer_frame_count as usize) {
+                    println!("need more samples");
+                    
+                    match rx_dev.recv_timeout(time::Duration::from_micros(1000)) {
+                        Ok(chunk) => {
+                            println!("got chunk");
+                            for element in chunk.iter() {
+                                sample_queue.push_back(*element);
+                            }
+                        }
+                        Err(_) => {
+                            println!("oops");
+                            break;
+                        }
+                    }
+                    println!("deque len2 {}", sample_queue.len());
+                }
+                //println!("wait for buf");
 
-        for n in 0..50 {
-            let mut databuf = vec![0u8; (bufferFrameCount*blockalign) as usize];
-            for m in 0..databuf.len()/2 {
-                databuf[m] = n as u8;
+                //println!("write");
+                render_client.write_to_device_from_deque(buffer_frame_count as usize, blockalign as usize, &mut sample_queue ).unwrap();
+                if h_event.wait_for_event(10000).is_err() {
+                    audio_client.stop_stream().unwrap();
+                    break;
+                }
             }
-            write_to_device(&render_client, bufferFrameCount as usize, blockalign as usize, &databuf )?;
+        });
 
-            if wait_for_event(&h_event, 100).is_err() {
-                stop_stream(&audio_client);
-                break;
-            }
-
-
+    let mut timeval: usize = 0;
+    for _n in 0..100 {
+        let mut databuf = vec![0u8; (1024*blockalign) as usize];
+        for m in 0..databuf.len() {
+            databuf[m] = ((timeval%256)>128) as u8 * 10;
+            timeval += 1;
         }
-
+        println!("sending");
+        tx_dev.send(databuf).unwrap();
+        
     }
-    let device = get_device_with_name(&devs, "SPDIF Interface (FX-AUDIO-DAC-X6)")?;
+    //let device = get_device_with_name(&devs, "SPDIF Interface (FX-AUDIO-DAC-X6)")?;
     println!("done");
     Ok(())
 }

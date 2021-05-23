@@ -1,5 +1,6 @@
 ::windows::include_bindings!();
 use Windows::Win32::System::PropertiesSystem::PROPERTYKEY;
+pub mod wasapi;
 
 #[allow(non_upper_case_globals)]
 pub const PKEY_Device_FriendlyName: PROPERTYKEY = PROPERTYKEY {
@@ -22,3 +23,5 @@ pub const PKEY_Device_DeviceDesc: PROPERTYKEY = PROPERTYKEY {
     ),
     pid: 2,
 };
+
+
