@@ -19,7 +19,7 @@ fn main() {
             WaitForSingleObject,
         },
         Windows::Win32::System::SystemServices::{
-            HANDLE,
+            HANDLE, S_OK, S_FALSE,
         },
         Windows::Win32::System::PropertiesSystem::PROPERTYKEY,
         Windows::Win32::System::SystemServices::PWSTR,
