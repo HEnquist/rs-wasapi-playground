@@ -16,10 +16,10 @@ fn playback_loop(rx_play: std::sync::mpsc::Receiver<Vec<u8>>) -> Res<()> {
     let device = collection.get_device_with_name("SPDIF Interface (FX-AUDIO-DAC-X6)")?;
     let mut audio_client = device.get_iaudioclient()?;
     // int16
-    //let desired_format_ex = WaveFormat::new(16, 16, &SampleType::Int, 48000, 2);
+    //let desired_format_ex = WaveFormat::new(16, 16, &SampleType::Int, 44100, 2);
     //let sharemode = ShareMode::Exclusive;
     // float32
-    let desired_format_ex = WaveFormat::new(32, 32, &SampleType::Float, 48000, 2);
+    let desired_format_ex = WaveFormat::new(32, 32, &SampleType::Float, 44100, 2);
     let sharemode = ShareMode::Shared;
     
 
@@ -28,13 +28,17 @@ fn playback_loop(rx_play: std::sync::mpsc::Receiver<Vec<u8>>) -> Res<()> {
 
     
 
-    let supported_format = audio_client.is_supported(&desired_format_ex, &sharemode)?;
+    let supported_format = match audio_client.is_supported(&desired_format_ex, &sharemode)? {
+        FormatSupported::Yes => desired_format_ex,
+        FormatSupported::ClosestMatch(modified_format) => modified_format,
+    };
+    supported_format.print_waveformat();
 
     let (def_time, min_time) = audio_client.get_periods()?;
     println!("default period {}, min period {}", def_time, min_time);
 
 
-    audio_client.initialize_client(&supported_format, def_time as i64, &Direction::Render, &sharemode)?;
+    audio_client.initialize_client(&supported_format, min_time as i64, &Direction::Render, &sharemode)?;
     println!("initialized playback");
 
     let h_event = audio_client.set_get_eventhandle()?;
@@ -47,15 +51,19 @@ fn playback_loop(rx_play: std::sync::mpsc::Receiver<Vec<u8>>) -> Res<()> {
     loop {
         buffer_frame_count = audio_client.get_available_frames()?;
         println!("New buffer frame count {}", buffer_frame_count);
-        //println!("deque len {}", sample_queue.len());
         while sample_queue.len() < (blockalign as usize * buffer_frame_count as usize) {
             println!("need more samples");
-            
-            match rx_play.recv_timeout(time::Duration::from_micros(1000000)) {
+            match rx_play.try_recv() {
                 Ok(chunk) => {
                     println!("got chunk");
                     for element in chunk.iter() {
                         sample_queue.push_back(*element);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    println!("no data, filling with zeros");
+                    for _ in 0..((blockalign as usize * buffer_frame_count as usize) - sample_queue.len())  {
+                        sample_queue.push_back(0);
                     }
                 }
                 Err(_) => {
@@ -87,24 +95,27 @@ fn capture_loop(tx_capt: std::sync::mpsc::SyncSender<Vec<u8>>, chunksize: usize)
     let mut audio_client = device.get_iaudioclient()?;
 
     // int16
-    //let desired_format_ex = WaveFormat::new(16, 16, &SampleType::Int, 48000, 2);
+    //let desired_format_ex = WaveFormat::new(16, 16, &SampleType::Int, 44100, 2);
     //let sharemode = ShareMode::Exclusive;
     // float32
-    let desired_format_ex = WaveFormat::new(32, 32, &SampleType::Float, 48000, 2);
+    let desired_format_ex = WaveFormat::new(32, 32, &SampleType::Float, 44100, 2);
     let sharemode = ShareMode::Shared;
 
     let blockalign = desired_format_ex.get_blockalign();
     println!("\nCapture requested");
     desired_format_ex.print_waveformat();
 
-    let supported_format = audio_client.is_supported(&desired_format_ex, &sharemode)?;
+    let supported_format = match audio_client.is_supported(&desired_format_ex, &sharemode)? {
+        FormatSupported::Yes => desired_format_ex,
+        FormatSupported::ClosestMatch(modified_format) => modified_format,
+    };
     println!("\nCapture got");
     supported_format.print_waveformat();
     let (def_time, min_time) = audio_client.get_periods()?;
     println!("default period {}, min period {}", def_time, min_time);
 
 
-    audio_client.initialize_client(&supported_format, def_time as i64, &Direction::Capture, &sharemode)?;
+    audio_client.initialize_client(&supported_format, min_time as i64, &Direction::Capture, &sharemode)?;
     println!("initialized capture");
 
     let h_event = audio_client.set_get_eventhandle()?;

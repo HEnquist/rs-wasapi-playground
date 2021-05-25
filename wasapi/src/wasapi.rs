@@ -225,6 +225,11 @@ impl Device {
 }
 
 
+pub enum FormatSupported {
+    Yes,
+    ClosestMatch(WaveFormat),
+}
+
 pub struct AudioClient {
     client: IAudioClient,
     direction: Direction,
@@ -234,26 +239,26 @@ pub struct AudioClient {
 impl AudioClient {
 
     // Check if a format is supported, return the nearest match (identical to requested for exclusive mode)
-    pub fn is_supported(&self, wave_fmt: &WaveFormat, sharemode: &ShareMode) -> WasapiRes<WaveFormat> {
+    pub fn is_supported(&self, wave_fmt: &WaveFormat, sharemode: &ShareMode) -> WasapiRes<FormatSupported> {
         let supported = match sharemode {
             ShareMode::Exclusive => {
                 unsafe { self.client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wave_fmt.as_waveformatex_ptr(), ptr::null_mut()).ok()? };
-                wave_fmt.clone()
+                FormatSupported::Yes
             },
             ShareMode::Shared => {
-                let mut supported_format: mem::MaybeUninit<WAVEFORMATEXTENSIBLE> = mem::MaybeUninit::zeroed();
+                let mut supported_format: mem::MaybeUninit<*mut WAVEFORMATEXTENSIBLE> = mem::MaybeUninit::zeroed();
                 let res = unsafe { self.client.IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, wave_fmt.as_waveformatex_ptr(), &mut supported_format as *mut _ as *mut *mut WAVEFORMATEX) };
+                res.ok()?;
                 if res == S_OK {
                     println!("supported");
-                    wave_fmt.clone()
+                    FormatSupported::Yes
                 }
                 else if res == S_FALSE {
                     println!("not supported");
-                    let new_fmt = unsafe {supported_format.assume_init()};
-                    WaveFormat{ wave_fmt: new_fmt }
+                    let new_fmt = unsafe {supported_format.assume_init().read()};
+                    FormatSupported::ClosestMatch(WaveFormat{ wave_fmt: new_fmt })
                 }
                 else {
-                    println!("really bad");
                     return Err(WasapiError::new("Unsupported format").into());
                 }
             }
