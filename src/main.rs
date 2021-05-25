@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier, RwLock};
 use std::thread;
-use std::time;
 use windows::initialize_mta;
 use std::error;
 use wasapi::wasapi::*;

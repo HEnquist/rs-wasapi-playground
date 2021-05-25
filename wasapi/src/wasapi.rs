@@ -5,7 +5,6 @@ use std::fmt;
 use std::collections::VecDeque;
 use widestring::U16CString;
 use windows::Interface;
-use windows::HRESULT;
 use std::error;
 use crate::{
     PKEY_Device_FriendlyName,
@@ -34,6 +33,7 @@ use crate::{
 
 type WasapiRes<T> = Result<T, Box<dyn error::Error>>;
 
+// Error returned by the Wasapi crate.
 #[derive(Debug)]
 pub struct WasapiError {
     desc: String,
@@ -59,18 +59,21 @@ impl WasapiError {
     }
 }
 
+// Audio direction, playback or capture.
 #[derive(Clone)]
 pub enum Direction {
     Render,
     Capture,
 }
 
+// Sharemode for device
 #[derive(Clone)]
 pub enum ShareMode {
     Shared,
     Exclusive,
 }
 
+// Sample type, float or integer
 #[derive(Clone)]
 pub enum SampleType {
     Float,
@@ -97,6 +100,7 @@ pub fn get_default_device(direction: &Direction) -> WasapiRes<Device> {
     }
 }
 
+// Struct wrapping an IMMDeviceCollection.
 pub struct DeviceCollection {
     collection: IMMDeviceCollection,
     direction: Direction,
@@ -155,6 +159,7 @@ impl DeviceCollection {
     }
 }
 
+// Struct wrapping an IMMDevice.
 pub struct Device {
     device: IMMDevice,
     direction: Direction,
@@ -224,12 +229,15 @@ impl Device {
     }
 }
 
-
+// Return type for is_supported.
 pub enum FormatSupported {
+    // The format is supported as it is
     Yes,
+    // The format is not supported as it is, this is the closest match.
     ClosestMatch(WaveFormat),
 }
 
+// Struct wrapping an IAudioClient.
 pub struct AudioClient {
     client: IAudioClient,
     direction: Direction,
@@ -379,6 +387,7 @@ impl AudioClient {
     }
 }
 
+// Struct wrapping an IAudioRenderClient.
 pub struct AudioRenderClient {
     client: IAudioRenderClient,
 }
@@ -431,6 +440,7 @@ impl AudioRenderClient {
     }
 }
 
+// Struct wrapping an IAudioCaptureClient.
 pub struct AudioCaptureClient {
     client: IAudioCaptureClient,
 }
@@ -486,6 +496,7 @@ impl AudioCaptureClient {
     }
 }
 
+// Struct wrapping a HANDLE (event handle).
 pub struct Handle {
     handle: HANDLE,
 }
@@ -502,6 +513,7 @@ impl Handle {
     }
 }
 
+// Struct wrapping a WAVEFORMATEXTENSIBLE format descriptor.
 #[derive(Clone)]
 pub struct WaveFormat {
     wave_fmt: WAVEFORMATEXTENSIBLE,
@@ -558,12 +570,55 @@ impl WaveFormat {
         WaveFormat{ wave_fmt }
     }
 
+    // get a pointer of type WAVEFORMATEX, used internally
     pub fn as_waveformatex_ptr(&self) -> *const WAVEFORMATEX {
         &self.wave_fmt as *const _ as *const WAVEFORMATEX
     }
 
+    // Read nBlockAlign.
     pub fn get_blockalign(&self) -> u32 {
         self.wave_fmt.Format.nBlockAlign as u32
     }
-}
 
+    // Read nAvgBytesPerSec.
+    pub fn get_avgbytespersec(&self) -> u32 {
+        self.wave_fmt.Format.nAvgBytesPerSec
+    }
+
+    // Read wBitsPerSample.
+    pub fn get_bitspersample(&self) -> u16 {
+        self.wave_fmt.Format.wBitsPerSample
+    }
+
+    // Read wValidBitsPerSample.
+    pub fn get_validbitspersample(&self) -> u16 {
+        unsafe { self.wave_fmt.Samples.wValidBitsPerSample }
+    }
+
+    // Read nSamplesPerSec.
+    pub fn get_samplespersec(&self) -> u32 {
+        self.wave_fmt.Format.nSamplesPerSec
+    }
+
+    // Read nChannels.
+    pub fn get_nchannels(&self) -> u16 {
+        self.wave_fmt.Format.nChannels
+    }
+
+    // Read dwChannelMask.
+    pub fn get_dwchannelmask(&self) -> u32 {
+        self.wave_fmt.dwChannelMask
+    }
+
+    // Read SubFormat.
+    pub fn get_subformat(&self) -> WasapiRes<SampleType> {
+        let subfmt = match self.wave_fmt.SubFormat {
+            KSDATAFORMAT_SUBTYPE_IEEE_FLOAT  => SampleType::Float,
+            KSDATAFORMAT_SUBTYPE_PCM => SampleType::Int,
+            _ => {
+                return Err(WasapiError::new(format!("Unknown subformat {:?}", {self.wave_fmt.SubFormat}).as_str()).into());
+            },
+        };
+        Ok(subfmt)
+    }
+}
